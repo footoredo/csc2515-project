@@ -27,7 +27,7 @@ VOCAB_SIZE = 100003
 USER_SIZE = 12186 + 1
 EMBEDDING_DIM = 128
 HIDDEN_DIM = 128
-BATCH_SIZE = 1000
+BATCH_SIZE = 200
 
 
 def reverse(o_text_idx, o_text_v, verbose=False):
@@ -44,9 +44,11 @@ def reverse(o_text_idx, o_text_v, verbose=False):
         text_idx[TEXT_LIMIT - ending - 1] = 1
     else:
         ending = TEXT_LIMIT
-    for i in range(ending):
-        text_idx[i + TEXT_LIMIT - ending] = o_text_idx[i]
-        text_v[i + TEXT_LIMIT - ending] = o_text_v[i]
+    text_idx[TEXT_LIMIT - ending:] = o_text_idx[:ending]
+    text_v[TEXT_LIMIT - ending:] = o_text_v[:ending]
+    # for i in range(ending):
+    #     text_idx[i + TEXT_LIMIT - ending] = o_text_idx[i]
+    #     text_v[i + TEXT_LIMIT - ending] = o_text_v[i]
     
     if verbose:
         print(o_text_idx)
@@ -70,9 +72,9 @@ class LSTMModel(nn.Module):
         self.lstmln = nn.LayerNorm(hidden_dim)
 
         self.extraw = nn.Linear(16 + extra_input_dim, hidden_dim)
-        # self.extra2gate = nn.Linear(hidden_dim, 1)
+        self.extra2gate = nn.Linear(hidden_dim, 1)
         self.extraln = nn.LayerNorm(hidden_dim)
-        self.hidden2scalar = nn.Linear(hidden_dim * 2, 1)
+        self.hidden2scalar = nn.Linear(hidden_dim, 1)
 
     def forward(self, sentence, user_idx, extra_inpts):
         embeds = self.word_embeddings(sentence)
@@ -96,12 +98,13 @@ class LSTMModel(nn.Module):
         user_embeds = self.user_embeddings(user_idx)
         extras = torch.cat([user_embeds, extra_inpts], -1)
         extras = F.relu(self.extraln(self.extraw(extras)))
-        # gate = torch.tanh(self.extra2gate(extras))
+        gate = torch.tanh(self.extra2gate(extras))
         # print(scalar_out.shape)
         # return torch.sigmoid(scalar_out)
         
-        out = torch.cat([lstm_out, extras], 1)
-        scalar_out = self.hidden2scalar(out)
+        # out = torch.cat([lstm_out, extras], 1)
+        out = lstm_out
+        scalar_out = self.hidden2scalar(out) * gate
         
         return scalar_out
 
@@ -185,6 +188,9 @@ class Dataset(torch.utils.data.Dataset):
         date_distribution = defaultdict(int)
         # print(text_data['text_idx'].max())
         # user_dict = defaultdict(int)
+        print("loading dataset from", text_file, flush=True)
+        st0 = time.time()
+        st = time.time()
         for i in range(n):
             ts = text_data['timestamp'][i]
             d0 = datetime.fromtimestamp(ts)
@@ -217,7 +223,8 @@ class Dataset(torch.utils.data.Dataset):
             #     print()
             # self.text_idx_data.append(np.concatenate([[user_idx], text_data['text_idx'][i]], -1))
             # self.text_v_data.append(np.concatenate([[0.], text_data['text_v'][i]], -1))
-            text_idx, text_v = reverse(text_data['text_idx'][i], text_data['text_v'][i], len(self.text_idx_data) == 0)
+            # text_idx, text_v = reverse(text_data['text_idx'][i], text_data['text_v'][i])
+            text_idx, text_v = text_data['text_idx'][i], text_data['text_v'][i]
             date = price_checker.convert_date(d0)
             self.text_idx_data.append(text_idx)
             self.text_v_data.append(text_v)
@@ -225,7 +232,13 @@ class Dataset(torch.utils.data.Dataset):
             self.rlr_data.append(np.array([d0.hour * 60 + d0.minute, text_data['replies'][i], text_data['likes'][i], text_data['retweets'][i]]))
             self.idx.append(i)
             date_distribution[date] += 1
+            
+            if i % 10000 == 0:
+                t = time.time()
+                print(f"#{i}, time: {t - st0:.2f}s, timedelta: {t - st:.2f}s", flush=True)
+                st = t
             # user_dict[text_data['user'][i]] += 1
+        print("loading dataset from", text_file, "done", flush=True)
 
         # print(len(user_dict))
         # uniq_users = sorted(user_dict.keys(), key=user_dict.get, reverse=True)
@@ -308,7 +321,7 @@ def main():
 
     print("start training")
 
-    for epoch in range(100):
+    for epoch in range(10):
         st = time.time()
         # for batch, (text_idx, text_v, price, idx) in enumerate(dataloader):
         epoch_loss = 0
@@ -360,7 +373,7 @@ def main():
         train_info = { 'epoch': epoch, 'loss': epoch_loss / epoch_n, 'acc': epoch_acc / epoch_n }
         train_infos.append(train_info)
         print("train:", train_info)
-        torch.save(model.state_dict(), str(data_dir / f"model-b-single-{epoch}.pkl"))
+        torch.save(model.state_dict(), str(data_dir / f"model-b-single-new-{epoch}.pkl"))
         sum_loss = 0.
         sum_acc = 0.
         sum_n = 0
@@ -381,10 +394,10 @@ def main():
         print("test:", test_info)
         test_infos.append(test_info)
 
-    joblib.dump(infos, data_dir / "infos.data")
-    joblib.dump(test_infos, data_dir / "test_infos.data")
-    joblib.dump(train_infos, data_dir / "train_infos.data")
-    torch.save(model.state_dict(), str(data_dir / "model.pkl"))
+    joblib.dump(infos, data_dir / "infos-new.data")
+    joblib.dump(test_infos, data_dir / "test_infos-new.data")
+    joblib.dump(train_infos, data_dir / "train_infos-new.data")
+    torch.save(model.state_dict(), str(data_dir / "model-new.pkl"))
 
 
 def test():
@@ -509,4 +522,4 @@ def human_test():
 
 
 if __name__ == "__main__":
-    test()
+    main()
