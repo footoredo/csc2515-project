@@ -15,7 +15,8 @@ import numpy as np
 from collections import Counter
 from collections import defaultdict
 
-data_dir = Path("~/ssd004/data/project").expanduser()
+# data_dir = Path("~/ssd004/data/project").expanduser()
+data_dir = Path("~/gobi2/data/project").expanduser()
 TEXT_LIMIT = 60
 VOCAB_SIZE = 100003
 # 0 : None
@@ -27,7 +28,33 @@ VOCAB_SIZE = 100003
 USER_SIZE = 12186 + 1
 EMBEDDING_DIM = 128
 HIDDEN_DIM = 128
-BATCH_SIZE = 100
+BATCH_SIZE = 50
+
+
+def reverse(o_text_idx, o_text_v, verbose=False):
+    text_idx = np.zeros_like(o_text_idx)
+    text_v = np.zeros_like(o_text_v)
+    
+    ending = None
+    for i in range(TEXT_LIMIT):
+        if o_text_idx[i] == 1:
+            ending = i
+            break
+    
+    if ending is not None:
+        text_idx[TEXT_LIMIT - ending - 1] = 1
+    else:
+        ending = TEXT_LIMIT
+    for i in range(ending):
+        text_idx[i + TEXT_LIMIT - ending] = o_text_idx[i]
+        text_v[i + TEXT_LIMIT - ending] = o_text_v[i]
+    
+    if verbose:
+        print(o_text_idx)
+        print(ending)
+        print(text_idx)
+            
+    return text_idx, text_v
 
 
 class LSTMModelOld(nn.Module):
@@ -76,12 +103,13 @@ class LSTMModel(nn.Module):
 
         self.lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True)
 
-        self.extraw = nn.Linear(16 + extra_input_dim, hidden_dim)
+        self.extraw = nn.Linear(16 + extra_input_dim + hidden_dim, hidden_dim)
         self.extra2gate = nn.Linear(hidden_dim, 1)
-        self.hiddenw = nn.Linear(hidden_dim, hidden_dim)
+        self.hiddenw1 = nn.Linear(hidden_dim, hidden_dim)
+        self.hiddenw2 = nn.Linear(hidden_dim, hidden_dim)
         self.hidden2scalar = nn.Linear(hidden_dim, 1)
 
-    def forward(self, sentence, user_idx, extra_inpts, mask):
+    def forward(self, sentence, user_idx, extra_inpts, mask, debug=False):
         # sentence: [batch, num_tweets, length]
         # mask: [batch, num_tweets]
         batch_size, num_tweets, length = sentence.shape
@@ -90,19 +118,27 @@ class LSTMModel(nn.Module):
         # inpt = torch.cat([embeds, extra_inpts], -1)
         inpt = embeds.view(batch_size * num_tweets, length, self.embedding_dim)
         lstm_out, _ = self.lstm(inpt)
-        lstm_out = F.relu(self.hiddenw(lstm_out[:, -1, :])).view(batch_size, num_tweets, self.hidden_dim)
+        lstm_out = lstm_out[:, -1].view(batch_size, num_tweets, self.hidden_dim)
+        lstm_out = F.relu(self.hiddenw1(lstm_out))
+        out = F.relu(self.hiddenw2(lstm_out))
 
         user_embeds = self.user_embeddings(user_idx)
-        extras = torch.cat([user_embeds, extra_inpts], -1)
+        extras = torch.cat([user_embeds, extra_inpts, lstm_out], -1)
         extras = F.relu(self.extraw(extras))
-        gate = torch.tanh(self.extra2gate(extras))  # [batch, num_tweets, 1]
+        extras_logits = self.extra2gate(extras)[:, :, 0]  # [batch, num_tweets]
+        extras_logits += -1e5 * (1 - mask)
+        gate = F.softmax(extras_logits, 1).unsqueeze(-1)
 
-        out = (lstm_out * gate * mask.unsqueeze(-1)).sum(1)  # [batch, hidden]
+        out = (out * gate).sum(1)  # [batch, hidden]
 
         scalar_out = self.hidden2scalar(out)
+        scalar_out = torch.sigmoid(scalar_out)
         # print(scalar_out.shape)
         # return torch.sigmoid(scalar_out)
-        return scalar_out
+        if debug:
+            return scalar_out, gate
+        else:
+            return scalar_out
 
 
 class PriceChecker:
@@ -130,10 +166,30 @@ class PriceChecker:
         return self.query_from_datetime(datetime.fromtimestamp(timestamp))
 
     def query_from_datetime(self, dt):
+        dt.hour = 0
+        dt.minute = 0
+        dt.second = 0
         try:
             return self.data[self.convert_date(dt)]
         except KeyError:
             return None
+        
+    def get_trend(self, d0, span=2):
+        d = d0 - timedelta(days=span // 2)
+        ps = [self.query_from_datetime(d)]
+        for _ in range(span - 1):
+            d += timedelta(days=1)
+            ps.append(self.query_from_datetime(d))
+            
+        if any(ps == None):
+            return None
+            
+        x = np.array(list(range(span)))
+        y = np.array(ps)
+        A = np.vstack([x, np.ones(len(x))]).T
+        m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+        # print(ps, m)
+        return m / np.mean(ps) * 100
 
 
 class Dataset(torch.utils.data.Dataset):
@@ -161,18 +217,20 @@ class Dataset(torch.utils.data.Dataset):
         for i in range(n):
             ts = text_data['timestamp'][i]
             d0 = datetime.fromtimestamp(ts)
-            p0 = price_checker.query_from_datetime(d0)
-            # should be day not second!!
-            d1 = d0 - timedelta(days=1)
-            p1 = price_checker.query_from_datetime(d1)
-            if p0 is None or p1 is None:
+            trend = price_checker.get_trend(d0, 5)
+            if trend is None:
                 continue
-            pp0 = float(p0['Open'])
-            pp1 = float(p1['Open'])
-            # diff = (pp1 - pp0) / pp0 * 100
-            diff = (pp0 - pp1) / pp1 * 100
-            self.price_data[date].append(diff)
-            assert pp0 > 0 and pp1 > 0
+            # p0 = price_checker.query_from_datetime(d0)
+            # # should be day not second!!
+            # d1 = d0 - timedelta(days=1)
+            # p1 = price_checker.query_from_datetime(d1)
+            # if p0 is None or p1 is None:
+            #     continue
+            # pp0 = float(p0['Open'])
+            # pp1 = float(p1['Open'])
+            # # diff = (pp1 - pp0) / pp0 * 100
+            # diff = (pp0 - pp1) / pp1 * 100
+            # assert pp0 > 0 and pp1 > 0
             try:
                 # user_idx = self.user_idx_dict[text_data['user'][i]] + 100004
                 user_idx = self.user_idx_dict[text_data['user'][i]]
@@ -197,9 +255,11 @@ class Dataset(torch.utils.data.Dataset):
             #     print()
             # self.text_idx_data.append(np.concatenate([[user_idx], text_data['text_idx'][i]], -1))
             # self.text_v_data.append(np.concatenate([[0.], text_data['text_v'][i]], -1))
+            text_idx, text_v = reverse(text_data['text_idx'][i], text_data['text_v'][i])
             date = price_checker.convert_date(d0)
-            self.text_idx_data[date].append(text_data['text_idx'][i])
-            self.text_v_data[date].append(text_data['text_v'][i])
+            self.price_data[date].append(trend)
+            self.text_idx_data[date].append(text_idx)
+            self.text_v_data[date].append(text_v)
             self.user_idx_data[date].append(user_idx)
             self.rlr_data[date].append(np.array([d0.hour * 60 + d0.minute, text_data['replies'][i], text_data['likes'][i], text_data['retweets'][i]]))
             self.idx[date].append(i)
@@ -207,15 +267,19 @@ class Dataset(torch.utils.data.Dataset):
             # user_dict[text_data['user'][i]] += 1
 
         valid_dates = []
+        sum_n = 0
         for date, n in date_distribution.items():
+            sum_n += n
             if not filter_dates or n >= filter_dates:
                 valid_dates.append(date)
+        print(f"num dates: {len(date_distribution.keys())}, sum_n: {sum_n}")
 
         valid_dates = sorted(valid_dates)
 
         for date in valid_dates:
             self.text_idx_data[date] = torch.tensor(np.array(self.text_idx_data[date])).to(self.device)
             self.text_v_data[date] = torch.tensor(np.array(self.text_v_data[date]), dtype=torch.float).unsqueeze(-1).to(self.device)
+            # print(date, np.var(self.price_data[date]))
             self.price_data[date] = torch.tensor(np.array(self.price_data[date]), dtype=torch.float).unsqueeze(-1).to(self.device)
             self.user_idx_data[date] = torch.tensor(np.array(self.user_idx_data[date])).to(self.device)
             self.rlr_data[date] = torch.tensor(np.array(self.rlr_data[date]), dtype=torch.float).to(self.device)
@@ -286,6 +350,8 @@ class Dataset(torch.utils.data.Dataset):
             if n < num_tweets:
                 for _ in range(num_tweets - n):
                     indices.append(0)
+            else:
+                indices = indices[:num_tweets]
             text_idx_data.append(self.text_idx_data[date][indices])
             text_v_data.append(self.text_v_data[date][indices])
             user_idx_data.append(self.user_idx_data[date][indices])
@@ -327,26 +393,42 @@ def main():
     print(torch.cuda.is_available())
     # device = torch.device("cpu") 
     device = torch.device("cuda:0") 
-    dataset = Dataset("cleaned_data-mini.obj", "BTC-USD.csv", device)
+    dataset = Dataset("cleaned_data-1m.obj", "BTC-USD.csv", device, filter_dates=1)
     # return
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    # dataloader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
     test_dataset = Dataset("cleaned_data-test-mini.obj", "BTC-USD.csv", device)
     # test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=BATCH_SIZE)
     model = LSTMModel(EMBEDDING_DIM, 4, HIDDEN_DIM, VOCAB_SIZE, USER_SIZE)
     model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     infos = []
+    train_infos = []
     test_infos = []
 
-    # criterion = nn.BCELoss()
+    criterion = nn.BCELoss()
 
     print("start training")
 
     for epoch in range(100):
         st = time.time()
         # for batch, (text_idx, text_v, price, idx) in enumerate(dataloader):
-        for batch, (text_idx, text_v, user_idx, rlr, mask, price, idx) in enumerate(dataset.iterate_batch(BATCH_SIZE, 10)):
+        epoch_loss = 0
+        epoch_acc = 0
+        epoch_n = 0
+        for batch, (text_idx, text_v, user_idx, rlr, mask, price, idx) in enumerate(dataset.iterate_batch(BATCH_SIZE, 1)):
+            if False and epoch == 0 and batch == 0:
+                print(text_idx.shape)
+                print(text_idx[0].cpu().numpy())
+                print(user_idx.shape)
+                print(user_idx[0].cpu().numpy())
+                print(rlr.shape)
+                print(rlr[0].cpu().numpy())
+                print(mask.shape)
+                print(mask[0].cpu().numpy())
+                print(price.shape)
+                print(price[0].cpu().numpy())
+                return
             # text_idx = text_idx.to(device)
             # text_v = text_v.to(device)
             # price = price.to(device)
@@ -361,14 +443,18 @@ def main():
             optimizer.zero_grad()
 
             price_pred = model(text_idx, user_idx, rlr, mask)
-            loss = (0.5 * (price_pred - price) ** 2).mean()
-            # loss = criterion(price_pred, _price)
-            acc = ((price_pred > 0).float() - _price).abs().mean()
+            # loss = (0.5 * (price_pred - price) ** 2).mean()
+            loss = criterion(price_pred, _price)
+            # acc = ((price_pred > 0).float() - _price).abs().mean()
+            acc = ((price_pred > 0.5).float() - _price).abs().mean()
 
             loss.backward()
             optimizer.step()
 
             info = { 'epoch': epoch, 'batch': batch, 'loss': loss.item(), 'acc': acc.item() }
+            epoch_loss += loss.item() * text_idx.shape[0]
+            epoch_acc += acc.item() * text_idx.shape[0]
+            epoch_n += text_idx.shape[0]
             infos.append(info)
 
             print(info, f"{time.time() - st:.2f}s", flush=True)
@@ -376,19 +462,23 @@ def main():
 
             if np.isnan(loss.item()):
                 return
-        torch.save(model.state_dict(), str(data_dir / f"model-{epoch}.pkl"))
+        train_info = { 'epoch': epoch, 'loss': epoch_loss / epoch_n, 'acc': epoch_acc / epoch_n }
+        train_infos.append(train_info)
+        print("train:", train_info)
+        torch.save(model.state_dict(), str(data_dir / f"model-b-{epoch}.pkl"))
         sum_loss = 0.
         sum_acc = 0.
         sum_n = 0
-        for batch, (text_idx, text_v, user_idx, rlr, mask, price, idx) in enumerate(test_dataset.iterate_batch(BATCH_SIZE)):
-            text_idx = text_idx.to(device)
-            text_v = text_v.to(device)
-            price = price.to(device)
+        for batch, (text_idx, text_v, user_idx, rlr, mask, price, idx) in enumerate(test_dataset.iterate_batch(BATCH_SIZE, 1)):
+            # text_idx = text_idx.to(device)
+            # text_v = text_v.to(device)
+            # price = price.to(device)
             _price = (price > 0).float()
             price_pred = model(text_idx, user_idx, rlr, mask)
-            # loss = criterion(price_pred, _price)
-            loss = (0.5 * (price_pred - price) ** 2).mean()
-            acc = ((price_pred > 0).float() - _price).abs().mean()
+            loss = criterion(price_pred, _price)
+            # loss = (0.5 * (price_pred - price) ** 2).mean()
+            # acc = ((price_pred > 0).float() - _price).abs().mean()
+            acc = ((price_pred > 0.5).float() - _price).abs().mean()
             # loss = (0.5 * (price_pred - _price) ** 2).mean()
             sum_loss += loss.item() * price.shape[0]
             sum_acc += acc.item() * price.shape[0]
@@ -403,37 +493,42 @@ def main():
 
 
 def test():
-    # dataset = Dataset("cleaned_data-test-mini.obj", "BTC-USD.csv")
     device = torch.device("cpu") 
-    dataset = Dataset("cleaned_data-mini.obj", "BTC-USD.csv", device)
+    dataset = Dataset("cleaned_data-test-mini.obj", "BTC-USD.csv", device)
+    # dataset = Dataset("cleaned_data-mini.obj", "BTC-USD.csv", device)
     # dataloader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE)
-    model = LSTMModel(EMBEDDING_DIM, 1, HIDDEN_DIM, VOCAB_SIZE)
-    model.load_state_dict(torch.load(str(data_dir / "model-60.pkl")))
+    model = LSTMModel(EMBEDDING_DIM, 4, HIDDEN_DIM, VOCAB_SIZE, USER_SIZE)
+    model.to(device)
+    model.load_state_dict(torch.load(str(data_dir / "model-1.pkl")))
     sum_loss = 0.
     sum_acc = 0.
     sum_n = 0
-    user_acc = defaultdict(float)
+    user_gate = defaultdict(float)
     user_n = defaultdict(int)
-    for batch, (text_idx, text_v, price, idx) in enumerate(dataset.iterate_batch(BATCH_SIZE)):
-        price_pred = model(text_idx, torch.zeros_like(text_v).to(device))
+    for batch, (text_idx, text_v, user_idx, rlr, mask, price, idx) in enumerate(dataset.iterate_batch(1, 30)):
+        price_pred, gate = model(text_idx, user_idx, rlr, mask, debug=True)
+        print(price[0].item(), price_pred[0].item(), mask[0].numpy())
         loss = (0.5 * (price_pred - price) ** 2)
         acc = (torch.sign(price) == torch.sign(price_pred)).float()
         sum_loss += loss.mean().item() * price.shape[0]
         sum_acc += acc.mean().item() * price.shape[0]
         sum_n += price.shape[0]
 
-        for i in range(price.shape[0]):
-            user = dataset.get_data('user', idx[i].item())
-            user_acc[user] += acc[i]
-            user_n[user] += 1
+        for i in range(user_idx.shape[0]):
+            for j in range(user_idx.shape[1]):
+                if mask[i, j] > 0.5:
+                    user = user_idx[i, j]
+                    user_gate[user] += gate[i, j].item()
+                    user_n[user] += 1
+        # break
 
-    for user in user_acc.keys():
-        user_acc[user] /= user_n[user]
+    for user in user_gate.keys():
+        user_gate[user] /= user_n[user]
 
-    users = sorted(user_acc.keys(), key=user_acc.get, reverse=True)
+    users = sorted(user_gate.keys(), key=user_gate.get, reverse=True)
     for user in users:
         if user_n[user] > 100:
-            print(user, user_acc[user], user_n[user])
+            print(user, user_gate[user], user_n[user])
 
 
     print(sum_loss / sum_n)

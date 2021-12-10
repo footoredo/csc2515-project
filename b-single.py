@@ -15,7 +15,7 @@ import numpy as np
 from collections import Counter
 from collections import defaultdict
 
-data_dir = Path("~/ssd004/data/project").expanduser()
+data_dir = Path("~/gobi2/data/project").expanduser()
 TEXT_LIMIT = 60
 VOCAB_SIZE = 100003
 # 0 : None
@@ -30,38 +30,30 @@ HIDDEN_DIM = 128
 BATCH_SIZE = 1000
 
 
-class LSTMModelOld(nn.Module):
-
-    def __init__(self, embedding_dim, extra_input_dim, hidden_dim, vocab_size, user_size):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-
-        self.word_embeddings = nn.Embedding(vocab_size, embedding_dim)
-        self.user_embeddings = nn.Embedding(user_size, 16)
-
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True)
-
-        self.extraw = nn.Linear(16 + extra_input_dim, hidden_dim)
-        self.extra2gate = nn.Linear(hidden_dim, 1)
-        self.hiddenw = nn.Linear(hidden_dim, hidden_dim)
-        self.hidden2scalar = nn.Linear(hidden_dim, 1)
-
-    def forward(self, sentence, user_idx, extra_inpts):
-        embeds = self.word_embeddings(sentence)
-        # print(embeds.shape, extra_inpts.shape)
-        # inpt = torch.cat([embeds, extra_inpts], -1)
-        inpt = embeds
-        lstm_out, _ = self.lstm(inpt)
-        scalar_out = F.relu(self.hiddenw(lstm_out[:, -1, :]))
-        scalar_out = self.hidden2scalar(scalar_out)
-
-        user_embeds = self.user_embeddings(user_idx)
-        extras = torch.cat([user_embeds, extra_inpts], -1)
-        extras = F.relu(self.extraw(extras))
-        gate = torch.tanh(self.extra2gate(extras))
-        # print(scalar_out.shape)
-        # return torch.sigmoid(scalar_out)
-        return scalar_out * gate
+def reverse(o_text_idx, o_text_v, verbose=False):
+    text_idx = np.zeros_like(o_text_idx)
+    text_v = np.zeros_like(o_text_v)
+    
+    ending = None
+    for i in range(TEXT_LIMIT):
+        if o_text_idx[i] == 1:
+            ending = i
+            break
+    
+    if ending is not None:
+        text_idx[TEXT_LIMIT - ending - 1] = 1
+    else:
+        ending = TEXT_LIMIT
+    for i in range(ending):
+        text_idx[i + TEXT_LIMIT - ending] = o_text_idx[i]
+        text_v[i + TEXT_LIMIT - ending] = o_text_v[i]
+    
+    if verbose:
+        print(o_text_idx)
+        print(ending)
+        print(text_idx)
+            
+    return text_idx, text_v
 
 
 class LSTMModel(nn.Module):
@@ -69,39 +61,48 @@ class LSTMModel(nn.Module):
     def __init__(self, embedding_dim, extra_input_dim, hidden_dim, vocab_size, user_size):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.embedding_dim = embedding_dim
 
         self.word_embeddings = nn.Embedding(vocab_size, embedding_dim)
         self.user_embeddings = nn.Embedding(user_size, 16)
 
         self.lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True)
+        # self.lstmw = nn.Linear(hidden_dim, hidden_dim)
+        self.lstmln = nn.LayerNorm(hidden_dim)
 
         self.extraw = nn.Linear(16 + extra_input_dim, hidden_dim)
-        self.extra2gate = nn.Linear(hidden_dim, 1)
-        self.hiddenw = nn.Linear(hidden_dim, hidden_dim)
-        self.hidden2scalar = nn.Linear(hidden_dim, 1)
+        # self.extra2gate = nn.Linear(hidden_dim, 1)
+        self.extraln = nn.LayerNorm(hidden_dim)
+        self.hidden2scalar = nn.Linear(hidden_dim * 2, 1)
 
-    def forward(self, sentence, user_idx, extra_inpts, mask):
-        # sentence: [batch, num_tweets, length]
-        # mask: [batch, num_tweets]
-        batch_size, num_tweets, length = sentence.shape
-        embeds = self.word_embeddings(sentence)  # [batch, num_tweets, length, embed]
+    def forward(self, sentence, user_idx, extra_inpts):
+        embeds = self.word_embeddings(sentence)
+        # print("embeds:", embeds.shape)
+        # print(embeds[0].detach().cpu().numpy())
+        # print(embeds[1].detach().cpu().numpy())
         # print(embeds.shape, extra_inpts.shape)
         # inpt = torch.cat([embeds, extra_inpts], -1)
-        inpt = embeds.view(batch_size * num_tweets, length, self.embedding_dim)
+        inpt = embeds
         lstm_out, _ = self.lstm(inpt)
-        lstm_out = F.relu(self.hiddenw(lstm_out[:, -1, :])).view(batch_size, num_tweets, self.hidden_dim)
+        lstm_out = lstm_out[:, -1, :]
+        # print("lstm_out:", lstm_out.shape)
+        # print(lstm_out[0].detach().cpu().numpy())
+        # print(lstm_out[1].detach().cpu().numpy())
+        # lstm_out = F.relu(self.lstmw(lstm_out))
+        lstm_out = self.lstmln(lstm_out)
+        
+        # print(scalar_out[0].detach().cpu().numpy())
+        # print(scalar_out[1].detach().cpu().numpy())
 
         user_embeds = self.user_embeddings(user_idx)
         extras = torch.cat([user_embeds, extra_inpts], -1)
-        extras = F.relu(self.extraw(extras))
-        gate = torch.tanh(self.extra2gate(extras))  # [batch, num_tweets, 1]
-
-        out = (lstm_out * gate * mask.unsqueeze(-1)).sum(1)  # [batch, hidden]
-
-        scalar_out = self.hidden2scalar(out)
+        extras = F.relu(self.extraln(self.extraw(extras)))
+        # gate = torch.tanh(self.extra2gate(extras))
         # print(scalar_out.shape)
         # return torch.sigmoid(scalar_out)
+        
+        out = torch.cat([lstm_out, extras], 1)
+        scalar_out = self.hidden2scalar(out)
+        
         return scalar_out
 
 
@@ -131,9 +132,35 @@ class PriceChecker:
 
     def query_from_datetime(self, dt):
         try:
-            return self.data[self.convert_date(dt)]
+            return self.data[self.convert_date(datetime(year=dt.year, month=dt.month, day=dt.day))]
         except KeyError:
             return None
+        
+    def get_price(self, dt, key="Open"):
+        data = self.query_from_datetime(dt)
+        if data is None:
+            return None
+        return float(data[key])
+        
+    def get_trend(self, d0, span=2):
+        d = d0 - timedelta(days=span // 2)
+        ps = [self.get_price(d)]
+        for _ in range(span - 1):
+            d += timedelta(days=1)
+            ps.append(self.get_price(d))
+            
+        # print(ps)
+            
+        for p in ps:
+            if p is None:
+                return None
+            
+        x = np.array(list(range(span)), dtype=np.float64)
+        y = np.array(ps)
+        A = np.vstack([x, np.ones(len(x))]).T
+        m, c = np.linalg.lstsq(A, y, rcond=None)[0]
+        # print(ps, m)
+        return m / np.mean(ps) * 100
 
 
 class Dataset(torch.utils.data.Dataset):
@@ -149,30 +176,23 @@ class Dataset(torch.utils.data.Dataset):
         self.device = device
         n = len(text_data['id'])
         price_checker = PriceChecker(price_file)
-        self.text_idx_data = defaultdict(list)
-        self.text_v_data = defaultdict(list)
-        self.price_data = defaultdict(list)
-        self.user_idx_data = defaultdict(list)
-        self.rlr_data = defaultdict(list)
-        self.idx = defaultdict(list)
+        self.text_idx_data = []
+        self.text_v_data = []
+        self.price_data = []
+        self.user_idx_data = []
+        self.rlr_data = []
+        self.idx = []
         date_distribution = defaultdict(int)
         # print(text_data['text_idx'].max())
         # user_dict = defaultdict(int)
         for i in range(n):
             ts = text_data['timestamp'][i]
             d0 = datetime.fromtimestamp(ts)
-            p0 = price_checker.query_from_datetime(d0)
-            # should be day not second!!
-            d1 = d0 - timedelta(days=1)
-            p1 = price_checker.query_from_datetime(d1)
-            if p0 is None or p1 is None:
+            trend = price_checker.get_trend(d0, 5)
+            if trend is None:
                 continue
-            pp0 = float(p0['Open'])
-            pp1 = float(p1['Open'])
-            # diff = (pp1 - pp0) / pp0 * 100
-            diff = (pp0 - pp1) / pp1 * 100
-            self.price_data.append(diff)
-            assert pp0 > 0 and pp1 > 0
+            # diff = (pp0 - pp1) / pp1 * 100
+            self.price_data.append(trend)
             try:
                 # user_idx = self.user_idx_dict[text_data['user'][i]] + 100004
                 user_idx = self.user_idx_dict[text_data['user'][i]]
@@ -197,29 +217,15 @@ class Dataset(torch.utils.data.Dataset):
             #     print()
             # self.text_idx_data.append(np.concatenate([[user_idx], text_data['text_idx'][i]], -1))
             # self.text_v_data.append(np.concatenate([[0.], text_data['text_v'][i]], -1))
+            text_idx, text_v = reverse(text_data['text_idx'][i], text_data['text_v'][i], len(self.text_idx_data) == 0)
             date = price_checker.convert_date(d0)
-            self.text_idx_data[date].append(text_data['text_idx'][i])
-            self.text_v_data[date].append(text_data['text_v'][i])
-            self.user_idx_data[date].append(user_idx)
-            self.rlr_data[date].append(np.array([d0.hour * 60 + d0.minute, text_data['replies'][i], text_data['likes'][i], text_data['retweets'][i]]))
-            self.idx[date].append(i)
+            self.text_idx_data.append(text_idx)
+            self.text_v_data.append(text_v)
+            self.user_idx_data.append(user_idx)
+            self.rlr_data.append(np.array([d0.hour * 60 + d0.minute, text_data['replies'][i], text_data['likes'][i], text_data['retweets'][i]]))
+            self.idx.append(i)
             date_distribution[date] += 1
             # user_dict[text_data['user'][i]] += 1
-
-        valid_dates = []
-        for date, n in date_distribution.items():
-            if n >= 10:
-                valid_dates.append(date)
-
-        valid_dates = sorted(valid_dates)
-
-        for date in valid_dates:
-            self.text_idx_data[date] = torch.tensor(np.array(self.text_idx_data[date])).to(self.device)
-            self.text_v_data[date] = torch.tensor(np.array(self.text_v_data[date]), dtype=torch.float).unsqueeze(-1).to(self.device)
-            self.price_data[date] = torch.tensor(np.array(self.price_data[date]), dtype=torch.float).unsqueeze(-1).to(self.device)
-            self.user_idx_data[date] = torch.tensor(np.array(self.user_idx_data[date])).to(self.device)
-            self.rlr_data[date] = torch.tensor(np.array(self.rlr_data[date]), dtype=torch.float).to(self.device)
-            self.idx[date] = torch.tensor(self.idx[date]).to(self.device)
 
         # print(len(user_dict))
         # uniq_users = sorted(user_dict.keys(), key=user_dict.get, reverse=True)
@@ -234,18 +240,17 @@ class Dataset(torch.utils.data.Dataset):
         
         # joblib.dump(user_idx, data_dir / "user_idx.obj")
 
-        self.n = len(valid_dates)
-        self.valid_dates = valid_dates
-        # self.text_idx_data = torch.tensor(np.array(self.text_idx_data)).to(self.device)
-        # self.text_v_data = torch.tensor(np.array(self.text_v_data), dtype=torch.float).unsqueeze(-1).to(self.device)
-        # self.price_data = torch.tensor(np.array(self.price_data), dtype=torch.float).unsqueeze(-1).to(self.device)
-        # self.user_idx_data = torch.tensor(np.array(self.user_idx_data)).to(self.device)
-        # self.rlr_data = torch.tensor(np.array(self.rlr_data), dtype=torch.float).to(self.device)
-        # self.idx = torch.tensor(self.idx).to(self.device)
+        self.n = len(self.price_data)
+        self.text_idx_data = torch.tensor(np.array(self.text_idx_data)).to(self.device)
+        self.text_v_data = torch.tensor(np.array(self.text_v_data), dtype=torch.float).unsqueeze(-1).to(self.device)
+        self.price_data = torch.tensor(np.array(self.price_data), dtype=torch.float).unsqueeze(-1).to(self.device)
+        self.user_idx_data = torch.tensor(np.array(self.user_idx_data)).to(self.device)
+        self.rlr_data = torch.tensor(np.array(self.rlr_data), dtype=torch.float).to(self.device)
+        self.idx = torch.tensor(self.idx).to(self.device)
         
 
     def __len__(self):
-        return len(self.price_data)
+        return self.n
 
     def __getitem__(self, idx):
         return (
@@ -268,12 +273,8 @@ class Dataset(torch.utils.data.Dataset):
         self.idx = self.idx[r]
         self.cur = 0
 
-    def build_dateset(self):
-        indices = copy.deepcopy(self.vli)
-        np.random.shuffle(indices)
-
     def iterate_batch(self, batch_size):
-        self.build_dateset()
+        self.reset()
 
         while self.cur < self.n:
             r = min(self.cur + batch_size, self.n)
@@ -290,16 +291,17 @@ def main():
     print(torch.cuda.is_available())
     # device = torch.device("cpu") 
     device = torch.device("cuda:0") 
-    dataset = Dataset("cleaned_data-1m.obj", "BTC-USD.csv", device)
-    return
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_dataset = Dataset("cleaned_data-test-mini.obj", "BTC-USD.csv", device)
+    dataset = Dataset("cleaned_data-5m.obj", "BTC-USD.csv", device)
+    # return
+    # dataloader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    test_dataset = Dataset("cleaned_data-test-1m.obj", "BTC-USD.csv", device)
     # test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=BATCH_SIZE)
-    model = LSTMModel(EMBEDDING_DIM, 3, HIDDEN_DIM, VOCAB_SIZE, USER_SIZE)
+    model = LSTMModel(EMBEDDING_DIM, 4, HIDDEN_DIM, VOCAB_SIZE, USER_SIZE)
     model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=0.1)
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
 
     infos = []
+    train_infos = []
     test_infos = []
 
     # criterion = nn.BCELoss()
@@ -309,6 +311,9 @@ def main():
     for epoch in range(100):
         st = time.time()
         # for batch, (text_idx, text_v, price, idx) in enumerate(dataloader):
+        epoch_loss = 0
+        epoch_acc = 0
+        epoch_n = 0
         for batch, (text_idx, text_v, user_idx, rlr, price, idx) in enumerate(dataset.iterate_batch(BATCH_SIZE)):
             # text_idx = text_idx.to(device)
             # text_v = text_v.to(device)
@@ -324,6 +329,16 @@ def main():
             optimizer.zero_grad()
 
             price_pred = model(text_idx, user_idx, rlr)
+            if batch == 0:
+                if epoch == 0:
+                    print("text_idx", text_idx.shape)
+                    print("user_idx", user_idx.shape)
+                    print("rlr", rlr.shape)
+                    print("price", price.shape)
+                    print(text_idx[0].cpu().numpy())
+                    print(text_idx[1].cpu().numpy())
+                print(price_pred[:20, 0].detach().cpu().numpy())
+                print(price[:20, 0].cpu().numpy())
             loss = (0.5 * (price_pred - price) ** 2).mean()
             # loss = criterion(price_pred, _price)
             acc = ((price_pred > 0).float() - _price).abs().mean()
@@ -332,6 +347,9 @@ def main():
             optimizer.step()
 
             info = { 'epoch': epoch, 'batch': batch, 'loss': loss.item(), 'acc': acc.item() }
+            epoch_loss += loss.item() * text_idx.shape[0]
+            epoch_acc += acc.item() * text_idx.shape[0]
+            epoch_n += text_idx.shape[0]
             infos.append(info)
 
             print(info, f"{time.time() - st:.2f}s", flush=True)
@@ -339,7 +357,10 @@ def main():
 
             if np.isnan(loss.item()):
                 return
-        torch.save(model.state_dict(), str(data_dir / f"model-{epoch}.pkl"))
+        train_info = { 'epoch': epoch, 'loss': epoch_loss / epoch_n, 'acc': epoch_acc / epoch_n }
+        train_infos.append(train_info)
+        print("train:", train_info)
+        torch.save(model.state_dict(), str(data_dir / f"model-b-single-{epoch}.pkl"))
         sum_loss = 0.
         sum_acc = 0.
         sum_n = 0
@@ -362,45 +383,98 @@ def main():
 
     joblib.dump(infos, data_dir / "infos.data")
     joblib.dump(test_infos, data_dir / "test_infos.data")
+    joblib.dump(train_infos, data_dir / "train_infos.data")
     torch.save(model.state_dict(), str(data_dir / "model.pkl"))
 
 
 def test():
     # dataset = Dataset("cleaned_data-test-mini.obj", "BTC-USD.csv")
-    device = torch.device("cpu") 
-    dataset = Dataset("cleaned_data-mini.obj", "BTC-USD.csv", device)
+    # device = torch.device("cpu") 
+    device = torch.device("cuda:0") 
+    dataset = Dataset("cleaned_data-test-1m.obj", "BTC-USD.csv", device)
     # dataloader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE)
-    model = LSTMModel(EMBEDDING_DIM, 1, HIDDEN_DIM, VOCAB_SIZE)
-    model.load_state_dict(torch.load(str(data_dir / "model-60.pkl")))
-    sum_loss = 0.
-    sum_acc = 0.
-    sum_n = 0
-    user_acc = defaultdict(float)
-    user_n = defaultdict(int)
-    for batch, (text_idx, text_v, price, idx) in enumerate(dataset.iterate_batch(BATCH_SIZE)):
-        price_pred = model(text_idx, torch.zeros_like(text_v).to(device))
-        loss = (0.5 * (price_pred - price) ** 2)
-        acc = (torch.sign(price) == torch.sign(price_pred)).float()
-        sum_loss += loss.mean().item() * price.shape[0]
-        sum_acc += acc.mean().item() * price.shape[0]
-        sum_n += price.shape[0]
+    model = LSTMModel(EMBEDDING_DIM, 4, HIDDEN_DIM, VOCAB_SIZE, USER_SIZE)
+    model.to(device)
+    
+    top20_infos = []
+    
+    for epoch in range(0, 90, 1):
+        print(f"--- Epoch {epoch} ---", flush=True)
+        
+        model.load_state_dict(torch.load(str(data_dir / f"model-b-single-{epoch}.pkl")))
+    
+        sum_loss = 0.
+        sum_acc = 0.
+        sum_n = 0
+        user_loss = defaultdict(float)
+        user_acc = defaultdict(float)
+        user_n = defaultdict(int)
+        for batch, (text_idx, text_v, user_idx, rlr, price, idx) in enumerate(dataset.iterate_batch(BATCH_SIZE)):
+            price_pred = model(text_idx, user_idx, rlr)
+            loss = (0.5 * (price_pred - price) ** 2)
+            acc = (torch.sign(price) == torch.sign(price_pred)).float()
+            sum_loss += loss.mean().item() * price.shape[0]
+            sum_acc += acc.mean().item() * price.shape[0]
+            sum_n += price.shape[0]
 
-        for i in range(price.shape[0]):
-            user = dataset.get_data('user', idx[i].item())
-            user_acc[user] += acc[i]
-            user_n[user] += 1
+            for i in range(price.shape[0]):
+                user = dataset.get_data('user', idx[i].item())
+                user_acc[user] += acc[i].item()
+                user_loss[user] += loss[i].item()
+                user_n[user] += 1
 
-    for user in user_acc.keys():
-        user_acc[user] /= user_n[user]
+        for user in user_n.keys():
+            user_acc[user] /= user_n[user]
+            user_loss[user] /= user_n[user]
+            
+        info = {
+            "avg_loss": sum_loss / sum_n,
+            "avg_acc": sum_acc / sum_n
+        }
 
-    users = sorted(user_acc.keys(), key=user_acc.get, reverse=True)
-    for user in users:
-        if user_n[user] > 100:
-            print(user, user_acc[user], user_n[user])
+        print(sum_loss / sum_n, flush=True)
+        print(sum_acc / sum_n, flush=True)
+        
+        sum_acc = 0.
 
+        print("\nTop 20 acc:")
+        users = sorted(user_acc.keys(), key=user_acc.get, reverse=True)
+        cnt = 0
+        user_data = []
+        for user in users:
+            if user_n[user] >= 200:
+                user_data.append((user, user_acc[user], user_loss[user], user_n[user]))
+                cnt += 1
+                if cnt <= 20:
+                    print(f"#{cnt}", user, user_acc[user], user_n[user])
+                    sum_acc += user_acc[user]
+                    
+        print("Top 20 acc avg acc:", sum_acc / 20)
+        
+        sum_loss = 0.
+        
+        print("\nTop 20 loss:")
+        users = sorted(user_loss.keys(), key=user_loss.get)
+        cnt = 0
+        for user in users:
+            if user_n[user] >= 200:
+                cnt += 1
+                if cnt <= 20:
+                    print(f"#{cnt}", user, user_loss[user], user_n[user])
+                    sum_loss += user_loss[user]
+                    
+        print("Top 20 loss avg loss:", sum_loss / 20)
+        
+        info["top20_acc"] = sum_acc / 20
+        info["top20_loss"] = sum_loss / 20
+        
+        top20_infos.append(info)
 
-    print(sum_loss / sum_n)
-    print(sum_acc / sum_n)
+        print("# >=200 accounts:", cnt, flush=True)
+
+        joblib.dump(user_data, data_dir / f"user_test_data-{epoch}.obj")
+    
+    joblib.dump(top20_infos, data_dir / "top20_infos.obj")
 
 
 def human_test():
@@ -435,4 +509,4 @@ def human_test():
 
 
 if __name__ == "__main__":
-    main()
+    test()
