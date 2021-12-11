@@ -12,7 +12,7 @@ import numpy as np
 from collections import Counter
 from collections import defaultdict
 
-data_dir = Path("~/ssd004/data/project").expanduser()
+data_dir = Path("~/gobi2/data/project").expanduser()
 TEXT_LIMIT = 60
 VOCAB_SIZE = 100000
 
@@ -73,11 +73,11 @@ def clean_words(words):
 
 class DatasetBuilder:
 
-    def __init__(self, filename, word_index=None, n=np.inf):
+    def __init__(self, filename, word_index=None, n=np.inf, name="default"):
         self.word_index = word_index
         self.n = n
 
-        self.load_words(filename)
+        self.load_words(filename, name)
 
         # thresholds = [100, 50, 20, 10, 5, 2]
         # i_threshold = 0
@@ -89,7 +89,7 @@ class DatasetBuilder:
         #     if i_threshold == len(thresholds):
         #         break
 
-    def load_words(self, filename):
+    def load_words(self, filename, name):
         count_words = self.word_index is None
         train_df = pd.read_csv(data_dir / f"{filename}.csv", sep=";", lineterminator='\r', chunksize=1000000)
         total_size = 0
@@ -132,22 +132,23 @@ class DatasetBuilder:
                         elif k == 'id' or k == 'replies' or k == 'likes' or k == 'retweets':
                             add_data(k, int(v))
                         elif k == 'text':
-                            cleaned_words_idx = np.zeros(TEXT_LIMIT, dtype=int)
-                            cleaned_words_v = np.zeros(TEXT_LIMIT, dtype=float)
-                            # print(v.split())
-                            words = v.split()
-                            for word_i, word in enumerate(words):
-                                if word_i >= TEXT_LIMIT:
-                                    break
-                                # print(word, index_word(word, self.word_index))
-                                idx, v = index_word(word, self.word_index)
-                                cleaned_words_idx[word_i] = idx
-                                cleaned_words_v[word_i] = v
-                            if len(words) < TEXT_LIMIT:
-                                cleaned_words_idx[len(words)] = 1
-                            # length_distribution[len(cleaned_words)] += 1
-                            add_data('text_idx', cleaned_words_idx)
-                            add_data('text_v', cleaned_words_v)
+                            add_data('text', v)
+                            # cleaned_words_idx = np.zeros(TEXT_LIMIT, dtype=int)
+                            # cleaned_words_v = np.zeros(TEXT_LIMIT, dtype=float)
+                            # # print(v.split())
+                            # words = v.split()
+                            # for word_i, word in enumerate(words):
+                            #     if word_i >= TEXT_LIMIT:
+                            #         break
+                            #     # print(word, index_word(word, self.word_index))
+                            #     idx, v = index_word(word, self.word_index)
+                            #     cleaned_words_idx[word_i] = idx
+                            #     cleaned_words_v[word_i] = v
+                            # if len(words) < TEXT_LIMIT:
+                            #     cleaned_words_idx[len(words)] = 1
+                            # # length_distribution[len(cleaned_words)] += 1
+                            # add_data('text_idx', cleaned_words_idx)
+                            # add_data('text_v', cleaned_words_v)
                     if cnt <= self.n:
                         for k, v in __cleaned_data.items():
                             cleaned_data[k].append(v)
@@ -175,11 +176,12 @@ class DatasetBuilder:
             pass
             # joblib.dump(self.word_counts, data_dir / "word_counts-clean.obj")
         else:
-            for k in ['id', 'timestamp', 'replies', 'likes', 'retweets', 'text_idx', 'text_v']:
+            # for k in ['id', 'timestamp', 'replies', 'likes', 'retweets', 'text_idx', 'text_v']:
+            for k in ['id', 'timestamp', 'replies', 'likes', 'retweets']:
                 cleaned_data[k] = np.array(cleaned_data[k])
                 print(k, cleaned_data[k].shape, cleaned_data[k].dtype)
 
-            joblib.dump(dict(cleaned_data), data_dir / "cleaned_data-1m.obj")
+            joblib.dump(dict(cleaned_data), data_dir / f"raw_data-{name}.obj")
 
     def build_word_index(self):
         self.uniq_words = sorted(self.word_counts, key=self.word_counts.get, reverse=True)
@@ -189,11 +191,13 @@ class DatasetBuilder:
         
 
 def main():
-    np.random.seed(0)
+    seed = hash("//".join(sys.argv[1:4])) % 2**32
+    print("seed:", seed)
+    np.random.seed(seed)
     # print(price_checker.query(2016, 1, 1))
     # print(price_checker.query(2019, 3, 31))
     word_index = joblib.load(data_dir / "word_index-clean.obj")
-    builder = DatasetBuilder(sys.argv[1], word_index, 1000000)
+    builder = DatasetBuilder(sys.argv[1], word_index, int(sys.argv[2]), sys.argv[3])
     # preprocess(sys.argv[1])
 
 
