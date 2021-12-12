@@ -45,8 +45,13 @@ class PriceChecker:
             return None
         return float(data[key])
         
-    def get_trend(self, d0, span=2):
-        d = d0 - timedelta(days=span // 2)
+    def get_trend(self, d0, span=2, only_past=False, only_future=False):
+        if only_future:
+            d = d0
+        elif only_past:
+            d = d0 - timedelta(days=span - 1)
+        else:
+            d = d0 - timedelta(days=span // 2)
         ps = [self.get_price(d)]
         for _ in range(span - 1):
             d += timedelta(days=1)
@@ -65,6 +70,16 @@ class PriceChecker:
         # print(ps, m)
         return m / np.mean(ps) * 200
     
+    def get_yesterday(self, d0):
+        d1 = d0 - timedelta(days=1)
+        p0 = self.get_price(d0)
+        p1 = self.get_price(d1)
+        
+        if p0 is None or p1 is None:
+            return None
+        
+        return (p0 - p1) / p1 * 100
+    
     
 def load_twitter_glove(dim):
     st = time.time()
@@ -76,21 +91,22 @@ def load_twitter_glove(dim):
         for i, line in enumerate(f):
             contents = line.split(' ')
             token = contents[0]
-            if token[0] == '<' and token[-1] == '>':
-                print(token)
+            # if token[0] == '<' and token[-1] == '>':
+            #     print(token)
             vec = np.array(list(map(float, contents[1:])), dtype=np.float)
-            if vec.shape[0] != dim:
-                print("!!!", line, len(contents))
-            if i == 0:
-                print(vec)
+            # if vec.shape[0] != dim:
+            #     print("!!!", line, len(contents))
+            # if i == 0:
+            #     print(vec)
             # print(i, vec.shape)
             idx_map[token] = i
             vecs.append(vec)
             words.append(token)
     # print(vecs[-1])
-    print("mean:", np.mean(vecs), "std:", np.std(vecs))
-    vecs.append(np.random.normal(loc=np.mean(vecs), scale=np.std(vecs), size=dim))
-    print(vecs[-1])
+    # print("mean:", np.mean(vecs), "std:", np.std(vecs))
+    # vecs.append(np.random.normal(loc=np.mean(vecs), scale=np.std(vecs), size=dim))
+    vecs.append(np.zeros(dim, dtype=np.float))
+    # print(vecs[-1])
     # print(vecs[-1].shape)
     words.append("<pad>")
     idx_map["<pad>"] = len(words) - 1

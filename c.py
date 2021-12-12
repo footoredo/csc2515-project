@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.nn import functional as F
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import joblib
 import numpy as np
 from datetime import datetime
@@ -29,9 +30,9 @@ from common import *
 # DROPOUT = 0.2
 
 
-EMBEDDING_DIM = 50
+EMBEDDING_DIM = 100
 TEXT_LIMIT = 200
-HIDDEN_DIM = 64
+HIDDEN_DIM = 128
 USER_SIZE = 12186 + 1
 BATCH_SIZE = 200
 NUM_LAYERS = 2
@@ -75,7 +76,7 @@ class Dataset:
         #             extra_info.append(data[i][3])
         #             self.n += 1
         
-        n_processes = 8
+        n_processes = 12
         chunk_size = (n + n_processes - 1) // n_processes
         ps = []
         data_queue = mp.Queue()
@@ -90,6 +91,7 @@ class Dataset:
             p.start()
             
         text_idx = []
+        text_length = []
         user_idx = []
         extra_info = []
         price = []
@@ -101,8 +103,9 @@ class Dataset:
                 n_finished += 1
                 print(n_finished, flush=True)
             else:
-                _text_idx, _user_idx, _extra_info, _price = data
+                _text_idx, _text_length, _user_idx, _extra_info, _price = data
                 text_idx.append(_text_idx)
+                text_length.append(_text_length)
                 user_idx.append(_user_idx)
                 extra_info.append(_extra_info)
                 price.append(_price)
@@ -130,15 +133,17 @@ class Dataset:
             #     st = t
         
             
+        print(f"Total valid data points: {self.n}.", flush=True)
         print(f"Total loading time: {time.time() - st0:.2f}s.", flush=True)
         
         self.data = {
             "text_idx": torch.tensor(np.array(text_idx)).to(device),
             "user_idx": torch.LongTensor(user_idx).to(device),
             "extra_info": torch.tensor(np.array(extra_info), dtype=torch.float).to(device),
-            "price": torch.tensor(price, dtype=torch.float).unsqueeze(-1).to(device)
+            "price": torch.tensor(price, dtype=torch.float).unsqueeze(-1).to(device),
+            "text_length": torch.LongTensor(text_length)
         }
-        self.ordered_data_keys = ["text_idx", "user_idx", "extra_info", "price"]
+        self.ordered_data_keys = ["text_idx", "text_length", "user_idx", "extra_info", "price"]
         self.cur = 0
         
     def _convert_data(self, idx, data_queue, timestamps, texts, users, replies, likes, retweets):
@@ -155,7 +160,8 @@ class Dataset:
             
             ts = timestamps[i]
             d0 = datetime.fromtimestamp(ts)
-            _price = price_checker.get_trend(d0, 3)
+            # _price = price_checker.get_trend(d0, 3)
+            _price = price_checker.get_trend(d0, 5, only_future=True)
             if _price is None:
                 continue
             
@@ -172,6 +178,11 @@ class Dataset:
                 else:
                     word = "<pad>"
                 _text_idx[i] = self.glove_idx_map[word]
+                
+            _text_length = min(TEXT_LIMIT, len(words))
+            
+            if _text_length == 0:
+                continue
             
             # text_idx.append(_text_idx)
             
@@ -185,7 +196,7 @@ class Dataset:
             
             _extra_info = np.array([d0.hour * 60 + d0.minute, replies[i], likes[i], retweets[i]])
             
-            data_queue.put((_text_idx, _user_idx, _extra_info, _price))
+            data_queue.put((_text_idx, _text_length, _user_idx, _extra_info, _price))
             
             # price.append(_price)
             # text_idx.append(_text_idx)
@@ -208,9 +219,13 @@ class Dataset:
         for key in self.data.keys():
             self.data[key] = self.data[key][indices]
         
-    def iter_batch(self, batch_size, shuffle=True, stop=True):
+    def iter_batch(self, batch_size, shuffle=True, stop=True, reset=True):
         # if shuffle:
         #     self.shuffle()
+        if reset:
+            if shuffle:
+                self.shuffle()
+            self.cur = 0
         while True:
             r = min(self.cur + batch_size, self.n)
             yield [self.data[key][self.cur: r] for key in self.ordered_data_keys]
@@ -237,27 +252,32 @@ class LSTMModel(nn.Module):
         self.lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True, num_layers=NUM_LAYERS, dropout=DROPOUT, bidirectional=True)
         # self.drop = nn.Dropout(p=0.5)
         # self.lstmw = nn.Linear(hidden_dim, hidden_dim)
-        # self.lstmln = nn.LayerNorm(hidden_dim)
+        self.lstmln = nn.LayerNorm(hidden_dim * 2)
 
         self.extraw = nn.Linear(64 + extra_input_dim, hidden_dim)
         self.extra2gate = nn.Linear(hidden_dim, 1)
-        # self.extraln = nn.LayerNorm(hidden_dim)
+        self.extraln = nn.LayerNorm(hidden_dim)
+        # self.hiddenln = nn.LayerNorm(hidden_dim * 3)
         self.hidden2scalar = nn.Linear(hidden_dim * 3, 1)
+        self.hidden2gate = nn.Linear(hidden_dim * 3, 1)
 
-    def forward(self, sentence, user_idx, extra_inpts):
+    def forward(self, sentence, sentence_length, user_idx, extra_inpts):
         embeds = self.word_embeddings(sentence)
         # print("embeds:", embeds.shape)
         # print(embeds[0].detach().cpu().numpy())
         # print(embeds[1].detach().cpu().numpy())
         # print(embeds.shape, extra_inpts.shape)
         # inpt = torch.cat([embeds, extra_inpts], -1)
-        inpt = embeds
+        inpt = pack_padded_sequence(embeds, sentence_length, batch_first=True, enforce_sorted=False)
         lstm_out, _ = self.lstm(inpt)
-        lstm_out = torch.cat([lstm_out[:, 0, self.hidden_dim:], lstm_out[:, -1, :self.hidden_dim]], 1)
+        lstm_out, _ = pad_packed_sequence(lstm_out, batch_first=True)
+        lstm_out = torch.cat([lstm_out[:, 0, self.hidden_dim:], lstm_out[range(len(lstm_out)), sentence_length - 1, :self.hidden_dim]], 1)
         # print("lstm_out:", lstm_out.shape)
         # print(lstm_out[0].detach().cpu().numpy())
         # print(lstm_out[1].detach().cpu().numpy())
         # lstm_out = F.relu(self.lstmw(lstm_out))
+        
+        # lstm_out = F.relu(self.lstmln(lstm_out))
         lstm_out = F.relu(lstm_out)
         
         # print(scalar_out[0].detach().cpu().numpy())
@@ -265,39 +285,44 @@ class LSTMModel(nn.Module):
 
         user_embeds = self.user_embeddings(user_idx)
         extras = torch.cat([user_embeds, extra_inpts], -1)
+        # extras = F.relu(self.extraln(self.extraw(extras)))
         extras = F.relu(self.extraw(extras))
-        # gate = torch.sigmoid(self.extra2gate(extras))
         
         # print(scalar_out.shape)
         # return torch.sigmoid(scalar_out)
         
         out = torch.cat([lstm_out, extras], 1)
         # out = lstm_out
+        gate = torch.sigmoid(self.hidden2gate(out)) * 0.99 + 0.01
         scalar_out = self.hidden2scalar(out)
         
-        return scalar_out
+        return scalar_out, gate
 
 
-def eval(epoch, batch, model, dataset, max_batch=10):
+def eval(epoch, batch, sum_batch, model, dataset, max_batch=None):
     epoch_loss = 0
     epoch_acc = 0
     epoch_n = 0
-    for _batch, (text_idx, user_idx, extra_info, price) in enumerate(dataset.iter_batch(200, shuffle=True, stop=False)):
-        if _batch >= max_batch:
+    if max_batch is None:
+        batch_generator = dataset.iter_batch(200, shuffle=True)
+    else:
+        batch_generator = dataset.iter_batch(200, shuffle=True, stop=False, reset=False)
+    for _batch, (text_idx, text_length, user_idx, extra_info, price) in enumerate(batch_generator):
+        if max_batch is not None and _batch >= max_batch:
             break
-        price_pred = model(text_idx, user_idx, extra_info)
-        loss = (0.5 * (price_pred - price) ** 2).detach().cpu().numpy()
-        acc = (torch.sign(price_pred) == torch.sign(price)).float().detach().cpu().numpy()
-        batch_size = loss.shape[0]
+        price_pred, weights = model(text_idx, text_length, user_idx, extra_info)
+        loss = ((0.5 * (price_pred - price) ** 2) * weights).sum() / weights.sum()
+        acc = ((torch.sign(price_pred) == torch.sign(price)).float() * weights).sum() / weights.sum()
+        batch_size = price.shape[0]
         
-        epoch_loss += loss.mean() * batch_size
-        epoch_acc += acc.mean() * batch_size
+        epoch_loss += loss.item() * batch_size
+        epoch_acc += acc.item() * batch_size
         epoch_n += batch_size
     
     epoch_loss /= epoch_n
     epoch_acc /= epoch_n
     
-    test_info = { 'epoch': epoch, 'batch': batch, 'loss': epoch_loss, 'acc': epoch_acc }
+    test_info = { 'epoch': epoch, 'batch': batch, 'sum_batch': sum_batch, 'loss': epoch_loss, 'acc': epoch_acc }
     
     return test_info
 
@@ -308,27 +333,33 @@ def train(run):
     eval_dataset = Dataset("raw_data-test-mini.obj", device)
     
     model = LSTMModel(EMBEDDING_DIM, 4, HIDDEN_DIM, dataset.vocab_size, USER_SIZE, dataset.glove_vec)
+    # model = LSTMModel(EMBEDDING_DIM, 4, HIDDEN_DIM, dataset.vocab_size, USER_SIZE, None)
     model.to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=0.1)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0)
     
     infos = []
     train_infos = []
     eval_infos = []
+    epoch_eval_infos = []
 
     criterion = nn.BCELoss()
 
     print("start training")
     
     sum_batch = 0
+    
+    epoch_eval_info = eval(0, 0, 0, model, eval_dataset, max_batch=None)
+    print('epoch eval', epoch_eval_info, flush=True)
+    epoch_eval_infos.append(epoch_eval_info)
 
-    for epoch in range(10):
+    for epoch in range(100):
         st = time.time()
         # for batch, (text_idx, text_v, price, idx) in enumerate(dataloader):
         epoch_loss = 0
         epoch_acc = 0
         epoch_n = 0
-        for batch, (text_idx, user_idx, extra_info, price) in enumerate(dataset.iter_batch(BATCH_SIZE)):
+        for batch, (text_idx, text_length, user_idx, extra_info, price) in enumerate(dataset.iter_batch(BATCH_SIZE)):
             # text_idx = text_idx.to(device)
             # text_v = text_v.to(device)
             # price = price.to(device)
@@ -342,7 +373,7 @@ def train(run):
             _price = (price > 0).float()
             optimizer.zero_grad()
 
-            price_pred = model(text_idx, user_idx, extra_info)
+            price_pred, weights = model(text_idx, text_length, user_idx, extra_info)
             if batch == 0:
                 if epoch == 0:
                     print("text_idx", text_idx.shape)
@@ -351,12 +382,13 @@ def train(run):
                     print("price", price.shape)
                     print(text_idx[0].cpu().numpy())
                     print(text_idx[1].cpu().numpy())
-                print(price_pred[:20, 0].detach().cpu().numpy())
-                print(price[:20, 0].cpu().numpy())
-            loss = (0.5 * (price_pred - price) ** 2).mean()
+                print("weights:", weights[:20, 0].detach().cpu().numpy())
+                print("pred:", price_pred[:20, 0].detach().cpu().numpy())
+                print("truth:", price[:20, 0].cpu().numpy())
+            loss = ((0.5 * (price_pred - price) ** 2) * weights).sum() / weights.sum()
             # loss = criterion(price_pred, _price)
             # acc = ((price_pred > 0).float() - _price).abs().mean()
-            acc = (torch.sign(price_pred) == torch.sign(price)).float().mean()
+            acc = ((torch.sign(price_pred) == torch.sign(price)).float() * weights).sum() / weights.sum()
 
             loss.backward()
             optimizer.step()
@@ -373,11 +405,11 @@ def train(run):
             if np.isnan(loss.item()):
                 return
             
+            sum_batch += 1
             if sum_batch % 100 == 0:
-                eval_info = eval(epoch, batch, model, eval_dataset, max_batch=10)
+                eval_info = eval(epoch, batch, sum_batch, model, eval_dataset, max_batch=10)
                 print('eval', eval_info, flush=True)
                 eval_infos.append(eval_info)
-            sum_batch += 1
             
         train_info = { 'epoch': epoch, 'loss': epoch_loss / epoch_n, 'acc': epoch_acc / epoch_n }
         train_infos.append(train_info)
@@ -386,6 +418,11 @@ def train(run):
         joblib.dump(infos, data_dir / f"infos-c-{run}.data")
         joblib.dump(train_infos, data_dir / f"train_infos-{run}.data")
         joblib.dump(eval_infos, data_dir / f"eval_infos-{run}.data")
+        
+        epoch_eval_info = eval(epoch, 0, 0, model, eval_dataset, max_batch=None)
+        print('epoch eval', epoch_eval_info, flush=True)
+        epoch_eval_infos.append(epoch_eval_info)
+        joblib.dump(epoch_eval_infos, data_dir / f"epoch_eval_infos-{run}.data")
         
     
 def test(run):
